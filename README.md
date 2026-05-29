@@ -11,7 +11,7 @@ DOOMTheDarkAges.exe
 MonsterHunterWilds.exe
 ```
 
-This list is case insensitive and the .exe is optional.
+This list is case insensitive and the .exe is optional. You can edit your custom list by clicking "Edit custom game list" in the system tray menu.
 
 You may choose to use either the default list, the custom list, or both.
 
