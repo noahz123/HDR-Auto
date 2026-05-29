@@ -44,7 +44,7 @@ mod app {
                 TH32CS_SNAPPROCESS,
             },
             unknwnbase::IUnknown,
-            winnt::{KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ},
+            winnt::{KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ},
             winreg::{
                 RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
                 RegSetValueExW, HKEY_CURRENT_USER,
@@ -75,12 +75,15 @@ mod app {
     const MENU_RUN_AT_STARTUP: usize = 1005;
     const MENU_QUIT: usize = 1006;
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
+    const SETTINGS_REGISTRY_SUBKEY: &str = r"Software\HDR Auto";
+    const GAME_LIST_FLAGS_REGISTRY_VALUE_NAME: &str = "GameListFlags";
     const STARTUP_REGISTRY_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const STARTUP_REGISTRY_VALUE_NAME: &str = APP_NAME;
     const DEFAULT_GAME_LIST_URL: &str =
         "https://raw.githubusercontent.com/noahz123/HDR-Auto/main/games_default.txt";
     const GAME_LIST_DEFAULT_FLAG: usize = 0b01;
     const GAME_LIST_CUSTOM_FLAG: usize = 0b10;
+    const ALL_GAME_LIST_FLAGS: usize = GAME_LIST_DEFAULT_FLAG | GAME_LIST_CUSTOM_FLAG;
     const INITIAL_GAME_LIST_FLAGS: usize = GAME_LIST_DEFAULT_FLAG;
     const GAME_LIST_DOWNLOAD_TIMEOUT_MS: DWORD = 5_000;
     const HTTP_STATUS_OK: DWORD = 200;
@@ -187,7 +190,9 @@ mod app {
         let _ = refresh_default_game_list(&game_list_paths);
 
         let quit = Arc::new(AtomicBool::new(false));
-        let active_game_list_flags = Arc::new(AtomicUsize::new(INITIAL_GAME_LIST_FLAGS));
+        let initial_game_list_flags =
+            load_saved_game_list_flags().unwrap_or(INITIAL_GAME_LIST_FLAGS);
+        let active_game_list_flags = Arc::new(AtomicUsize::new(initial_game_list_flags));
         let monitor_quit = Arc::clone(&quit);
         let monitor_game_list_paths = game_list_paths.clone();
         let monitor_game_list_flags = Arc::clone(&active_game_list_flags);
@@ -845,8 +850,75 @@ mod app {
 
     fn toggle_game_list_flag(flag: usize) {
         if let Some(active_flags) = ACTIVE_GAME_LIST_FLAGS.get() {
-            active_flags.fetch_xor(flag, Ordering::SeqCst);
+            let previous_flags = active_flags.fetch_xor(flag, Ordering::SeqCst);
+            let new_flags = previous_flags ^ flag;
+            let _ = save_game_list_flags(new_flags);
         }
+    }
+
+    fn load_saved_game_list_flags() -> Option<usize> {
+        saved_game_list_flags().ok().map(sanitize_game_list_flags)
+    }
+
+    fn saved_game_list_flags() -> io::Result<usize> {
+        let key = match open_settings_key(KEY_QUERY_VALUE) {
+            Ok(key) => key,
+            Err(error) if is_not_found(&error) => return Ok(INITIAL_GAME_LIST_FLAGS),
+            Err(error) => return Err(error),
+        };
+        let name = to_wide_null(GAME_LIST_FLAGS_REGISTRY_VALUE_NAME);
+        let mut value_type = 0;
+        let mut flags: DWORD = 0;
+        let mut byte_len = mem::size_of::<DWORD>() as DWORD;
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                name.as_ptr(),
+                ptr::null_mut(),
+                &mut value_type,
+                &mut flags as *mut DWORD as *mut u8,
+                &mut byte_len,
+            )
+        };
+
+        if registry_status_is(status, ERROR_FILE_NOT_FOUND) {
+            return Ok(INITIAL_GAME_LIST_FLAGS);
+        }
+        if !registry_status_is(status, ERROR_SUCCESS) {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        if value_type != REG_DWORD || byte_len != mem::size_of::<DWORD>() as DWORD {
+            return Ok(INITIAL_GAME_LIST_FLAGS);
+        }
+
+        Ok(flags as usize)
+    }
+
+    fn save_game_list_flags(flags: usize) -> io::Result<()> {
+        let key = create_settings_key(KEY_SET_VALUE)?;
+        let name = to_wide_null(GAME_LIST_FLAGS_REGISTRY_VALUE_NAME);
+        let flags = sanitize_game_list_flags(flags) as DWORD;
+        let byte_len = mem::size_of::<DWORD>() as DWORD;
+        let status = unsafe {
+            RegSetValueExW(
+                key.0,
+                name.as_ptr(),
+                0,
+                REG_DWORD,
+                &flags as *const DWORD as *const u8,
+                byte_len,
+            )
+        };
+
+        if registry_status_is(status, ERROR_SUCCESS) {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    }
+
+    fn sanitize_game_list_flags(flags: usize) -> usize {
+        flags & ALL_GAME_LIST_FLAGS
     }
 
     fn edit_custom_game_list() -> io::Result<()> {
@@ -1000,8 +1072,45 @@ mod app {
         }
     }
 
+    fn open_settings_key(access: DWORD) -> io::Result<RegistryKey> {
+        let subkey = to_wide_null(SETTINGS_REGISTRY_SUBKEY);
+        let mut key = ptr::null_mut();
+        let status =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut key) };
+
+        if registry_status_is(status, ERROR_SUCCESS) {
+            Ok(RegistryKey(key))
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    }
+
     fn create_startup_key(access: DWORD) -> io::Result<RegistryKey> {
         let subkey = to_wide_null(STARTUP_REGISTRY_SUBKEY);
+        let mut key = ptr::null_mut();
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                ptr::null_mut(),
+                0,
+                access,
+                ptr::null_mut(),
+                &mut key,
+                ptr::null_mut(),
+            )
+        };
+
+        if registry_status_is(status, ERROR_SUCCESS) {
+            Ok(RegistryKey(key))
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    }
+
+    fn create_settings_key(access: DWORD) -> io::Result<RegistryKey> {
+        let subkey = to_wide_null(SETTINGS_REGISTRY_SUBKEY);
         let mut key = ptr::null_mut();
         let status = unsafe {
             RegCreateKeyExW(
@@ -1357,6 +1466,12 @@ mod app {
             fs::remove_dir_all(&dir)?;
             assert!(games.is_empty());
             Ok(())
+        }
+
+        #[test]
+        fn sanitize_game_list_flags_keeps_known_flags_only() {
+            assert_eq!(sanitize_game_list_flags(usize::MAX), ALL_GAME_LIST_FLAGS);
+            assert_eq!(sanitize_game_list_flags(0), 0);
         }
 
         #[test]
