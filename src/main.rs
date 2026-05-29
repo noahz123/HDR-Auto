@@ -11,6 +11,7 @@ mod app {
         fs, io, mem,
         os::windows::ffi::OsStrExt,
         path::{Path, PathBuf},
+        process::Command,
         ptr,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -70,8 +71,9 @@ mod app {
     const MENU_TOGGLE_HDR: usize = 1001;
     const MENU_USE_DEFAULT_LIST: usize = 1002;
     const MENU_USE_CUSTOM_LIST: usize = 1003;
-    const MENU_RUN_AT_STARTUP: usize = 1004;
-    const MENU_QUIT: usize = 1005;
+    const MENU_EDIT_CUSTOM_LIST: usize = 1004;
+    const MENU_RUN_AT_STARTUP: usize = 1005;
+    const MENU_QUIT: usize = 1006;
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
     const STARTUP_REGISTRY_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const STARTUP_REGISTRY_VALUE_NAME: &str = APP_NAME;
@@ -528,6 +530,9 @@ mod app {
                     MENU_USE_CUSTOM_LIST => {
                         toggle_game_list_flag(GAME_LIST_CUSTOM_FLAG);
                     }
+                    MENU_EDIT_CUSTOM_LIST => {
+                        let _ = edit_custom_game_list();
+                    }
                     MENU_RUN_AT_STARTUP => {
                         let _ = set_startup_enabled(!startup_enabled());
                     }
@@ -566,6 +571,7 @@ mod app {
         let toggle = to_wide_null("Toggle HDR now");
         let default_list = to_wide_null("Use default game list");
         let custom_list = to_wide_null("Use custom game list");
+        let edit_custom_list = to_wide_null("Edit custom game list");
         let startup = to_wide_null("Run at Windows startup");
         let quit = to_wide_null("Quit");
         let current_game_list_flags = game_list_flags();
@@ -583,6 +589,12 @@ mod app {
             MF_STRING | checked_if(current_game_list_flags & GAME_LIST_CUSTOM_FLAG != 0),
             MENU_USE_CUSTOM_LIST,
             custom_list.as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_EDIT_CUSTOM_LIST,
+            edit_custom_list.as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(
@@ -623,6 +635,13 @@ mod app {
         if let Some(active_flags) = ACTIVE_GAME_LIST_FLAGS.get() {
             active_flags.fetch_xor(flag, Ordering::SeqCst);
         }
+    }
+
+    fn edit_custom_game_list() -> io::Result<()> {
+        let paths = game_list_paths()?;
+        ensure_game_list_files(&paths)?;
+        Command::new("notepad.exe").arg(&paths.custom).spawn()?;
+        Ok(())
     }
 
     fn startup_enabled() -> bool {
