@@ -57,9 +57,7 @@ BlackOpsColdWar.exe
 BlackOps4.exe
 ModernWarfare.exe
 cod.exe
-cod.exe
 Vanguard.exe
-cod.exe
 s2_sp64_ship.exe
 CaptainBlood.exe
 CaptainGazmanDayOfTheRage.exe
@@ -109,7 +107,6 @@ EoCApp.exe
 EoCApp.exe
 DOOMEternalx64vk.exe
 DOOMTheDarkAges.exe
-Dragon Age The Veilguard.exe
 SparkingZERO.exe
 DD2.exe
 DreamEnginesNomadCities.exe
