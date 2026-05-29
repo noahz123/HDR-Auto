@@ -77,9 +77,23 @@ mod app {
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
     const STARTUP_REGISTRY_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const STARTUP_REGISTRY_VALUE_NAME: &str = APP_NAME;
+    const DEFAULT_GAME_LIST_URL: &str =
+        "https://raw.githubusercontent.com/noahz123/HDR-Auto/main/games_default.txt";
     const GAME_LIST_DEFAULT_FLAG: usize = 0b01;
     const GAME_LIST_CUSTOM_FLAG: usize = 0b10;
     const INITIAL_GAME_LIST_FLAGS: usize = GAME_LIST_DEFAULT_FLAG;
+    const GAME_LIST_DOWNLOAD_TIMEOUT_MS: DWORD = 5_000;
+    const HTTP_STATUS_OK: DWORD = 200;
+    const INTERNET_OPEN_TYPE_PRECONFIG: DWORD = 0;
+    const INTERNET_OPTION_CONNECT_TIMEOUT: DWORD = 2;
+    const INTERNET_OPTION_SEND_TIMEOUT: DWORD = 5;
+    const INTERNET_OPTION_RECEIVE_TIMEOUT: DWORD = 6;
+    const INTERNET_FLAG_RELOAD: DWORD = 0x8000_0000;
+    const INTERNET_FLAG_NO_CACHE_WRITE: DWORD = 0x0400_0000;
+    const HTTP_QUERY_STATUS_CODE: DWORD = 19;
+    const HTTP_QUERY_FLAG_NUMBER: DWORD = 0x2000_0000;
+    const DOWNLOAD_BUFFER_SIZE: usize = 8 * 1024;
+    const MIN_DOWNLOADED_GAME_LIST_ENTRIES: usize = 25;
 
     static QUIT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     static ACTIVE_GAME_LIST_FLAGS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
@@ -119,6 +133,45 @@ mod app {
         fn SHCreateMemStream(init: *const u8, init_len: UINT) -> *mut IUnknown;
     }
 
+    #[link(name = "wininet")]
+    extern "system" {
+        fn InternetOpenW(
+            agent: *const u16,
+            access_type: DWORD,
+            proxy: *const u16,
+            proxy_bypass: *const u16,
+            flags: DWORD,
+        ) -> *mut c_void;
+        fn InternetOpenUrlW(
+            internet: *mut c_void,
+            url: *const u16,
+            headers: *const u16,
+            headers_len: DWORD,
+            flags: DWORD,
+            context: usize,
+        ) -> *mut c_void;
+        fn InternetReadFile(
+            file: *mut c_void,
+            buffer: *mut c_void,
+            bytes_to_read: DWORD,
+            bytes_read: *mut DWORD,
+        ) -> i32;
+        fn InternetSetOptionW(
+            internet: *mut c_void,
+            option: DWORD,
+            buffer: *mut c_void,
+            buffer_len: DWORD,
+        ) -> i32;
+        fn InternetCloseHandle(internet: *mut c_void) -> i32;
+        fn HttpQueryInfoW(
+            request: *mut c_void,
+            info_level: DWORD,
+            buffer: *mut c_void,
+            buffer_len: *mut DWORD,
+            index: *mut DWORD,
+        ) -> i32;
+    }
+
     pub fn main() -> io::Result<()> {
         unsafe {
             enable_high_dpi_rendering();
@@ -131,6 +184,7 @@ mod app {
 
         let game_list_paths = game_list_paths()?;
         ensure_game_list_files(&game_list_paths)?;
+        let _ = refresh_default_game_list(&game_list_paths);
 
         let quit = Arc::new(AtomicBool::new(false));
         let active_game_list_flags = Arc::new(AtomicUsize::new(INITIAL_GAME_LIST_FLAGS));
@@ -251,6 +305,164 @@ mod app {
 
         if !paths.custom.exists() {
             fs::write(&paths.custom, "")?;
+        }
+
+        Ok(())
+    }
+
+    fn refresh_default_game_list(paths: &GameListPaths) -> io::Result<()> {
+        let contents = download_text(DEFAULT_GAME_LIST_URL)?;
+        if !valid_default_game_list_download(&contents) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "downloaded default game list did not look valid",
+            ));
+        }
+
+        write_file_atomically(&paths.default, contents.as_bytes())
+    }
+
+    fn download_text(url: &str) -> io::Result<String> {
+        let bytes = download_bytes(url)?;
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn download_bytes(url: &str) -> io::Result<Vec<u8>> {
+        let agent = to_wide_null(APP_NAME);
+        let session = unsafe {
+            InternetOpenW(
+                agent.as_ptr(),
+                INTERNET_OPEN_TYPE_PRECONFIG,
+                ptr::null(),
+                ptr::null(),
+                0,
+            )
+        };
+        if session.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let session = InternetHandle(session);
+
+        set_internet_timeout(session.0, INTERNET_OPTION_CONNECT_TIMEOUT);
+        set_internet_timeout(session.0, INTERNET_OPTION_SEND_TIMEOUT);
+        set_internet_timeout(session.0, INTERNET_OPTION_RECEIVE_TIMEOUT);
+
+        let url = to_wide_null(url);
+        let request = unsafe {
+            InternetOpenUrlW(
+                session.0,
+                url.as_ptr(),
+                ptr::null(),
+                0,
+                INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE,
+                0,
+            )
+        };
+        if request.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let request = InternetHandle(request);
+
+        let status = http_status_code(request.0)?;
+        if status != HTTP_STATUS_OK {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("default game list download returned HTTP {status}"),
+            ));
+        }
+
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; DOWNLOAD_BUFFER_SIZE];
+        loop {
+            let mut read = 0;
+            let ok = unsafe {
+                InternetReadFile(
+                    request.0,
+                    buffer.as_mut_ptr() as *mut c_void,
+                    buffer.len() as DWORD,
+                    &mut read,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if read == 0 {
+                break;
+            }
+
+            bytes.extend_from_slice(&buffer[..read as usize]);
+        }
+
+        Ok(bytes)
+    }
+
+    struct InternetHandle(*mut c_void);
+
+    impl Drop for InternetHandle {
+        fn drop(&mut self) {
+            unsafe {
+                InternetCloseHandle(self.0);
+            }
+        }
+    }
+
+    fn set_internet_timeout(handle: *mut c_void, option: DWORD) {
+        let mut timeout = GAME_LIST_DOWNLOAD_TIMEOUT_MS;
+        unsafe {
+            InternetSetOptionW(
+                handle,
+                option,
+                &mut timeout as *mut DWORD as *mut c_void,
+                mem::size_of::<DWORD>() as DWORD,
+            );
+        }
+    }
+
+    fn http_status_code(request: *mut c_void) -> io::Result<DWORD> {
+        let mut status = 0;
+        let mut status_len = mem::size_of::<DWORD>() as DWORD;
+        let mut index = 0;
+        let ok = unsafe {
+            HttpQueryInfoW(
+                request,
+                HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                &mut status as *mut DWORD as *mut c_void,
+                &mut status_len,
+                &mut index,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(status)
+    }
+
+    fn valid_default_game_list_download(contents: &str) -> bool {
+        let prefix = contents
+            .trim_start()
+            .chars()
+            .take(512)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if prefix.starts_with("404:") || prefix.starts_with("<!doctype") || prefix.contains("<html")
+        {
+            return false;
+        }
+
+        contents.lines().filter_map(normalize_game_name).count() >= MIN_DOWNLOADED_GAME_LIST_ENTRIES
+    }
+
+    fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = path.with_extension("txt.download");
+        fs::write(&temp_path, contents)?;
+        if let Err(error) = fs::rename(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
         }
 
         Ok(())
@@ -1144,6 +1356,39 @@ mod app {
 
             fs::remove_dir_all(&dir)?;
             assert!(games.is_empty());
+            Ok(())
+        }
+
+        #[test]
+        fn valid_default_game_list_download_accepts_game_entries() {
+            let mut contents = String::new();
+            for index in 0..MIN_DOWNLOADED_GAME_LIST_ENTRIES {
+                contents.push_str(&format!("game-{index}.exe\n"));
+            }
+
+            assert!(valid_default_game_list_download(&contents));
+        }
+
+        #[test]
+        fn valid_default_game_list_download_rejects_error_pages() {
+            assert!(!valid_default_game_list_download(
+                "<!DOCTYPE html><html><body>Not a game list</body></html>"
+            ));
+            assert!(!valid_default_game_list_download("404: Not Found"));
+        }
+
+        #[test]
+        fn write_file_atomically_replaces_existing_file() -> io::Result<()> {
+            let dir = unique_temp_dir("atomic-write");
+            fs::create_dir_all(&dir)?;
+            let path = dir.join("games_default.txt");
+            fs::write(&path, "old.exe\n")?;
+
+            write_file_atomically(&path, b"new.exe\n")?;
+
+            assert_eq!(fs::read_to_string(&path)?, "new.exe\n");
+            assert!(!path.with_extension("txt.download").exists());
+            fs::remove_dir_all(&dir)?;
             Ok(())
         }
 
