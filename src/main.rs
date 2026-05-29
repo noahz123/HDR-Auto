@@ -7,7 +7,7 @@ compile_error!("hdr-auto is a Windows-only tray app.");
 mod app {
     use std::{
         collections::HashSet,
-        ffi::OsStr,
+        ffi::{c_void, OsStr},
         fs, io, mem,
         os::windows::ffi::OsStrExt,
         path::{Path, PathBuf},
@@ -23,7 +23,10 @@ mod app {
     use winapi::{
         shared::{
             minwindef::{DWORD, LPARAM, LRESULT, TRUE, UINT, WPARAM},
-            windef::{HBRUSH, HCURSOR, HICON, HWND, POINT},
+            ntdef::HANDLE,
+            windef::{
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, HBRUSH, HCURSOR, HICON, HWND, POINT,
+            },
             winerror::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
         },
         um::{
@@ -39,19 +42,22 @@ mod app {
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                 TH32CS_SNAPPROCESS,
             },
+            unknwnbase::IUnknown,
             winnt::{KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ},
             winreg::{
                 RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
                 RegSetValueExW, HKEY_CURRENT_USER,
             },
             winuser::{
-                AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW,
-                PostMessageW, PostQuitMessage, RegisterClassW, SendInput, SetForegroundWindow,
-                TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDI_APPLICATION, INPUT,
-                INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-                MF_UNCHECKED, MSG, TPM_RIGHTBUTTON, VK_LWIN, VK_MENU, WM_APP, WM_CLOSE, WM_COMMAND,
-                WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+                AppendMenuW, CopyImage, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+                DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
+                GetMessageW, GetSystemMetrics, LoadIconW, PostMessageW, PostQuitMessage,
+                RegisterClassW, SendInput, SetForegroundWindow, SetProcessDPIAware,
+                SetProcessDpiAwarenessContext, TrackPopupMenu, TranslateMessage, CS_HREDRAW,
+                CS_VREDRAW, IDI_APPLICATION, IMAGE_ICON, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
+                KEYEVENTF_KEYUP, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
+                SM_CXSMICON, SM_CYSMICON, TPM_RIGHTBUTTON, VK_LWIN, VK_MENU, WM_APP, WM_CLOSE,
+                WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
             },
         },
     };
@@ -69,11 +75,53 @@ mod app {
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
     const STARTUP_REGISTRY_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const STARTUP_REGISTRY_VALUE_NAME: &str = APP_NAME;
+    const GAME_LIST_DEFAULT_FLAG: usize = 0b01;
+    const GAME_LIST_CUSTOM_FLAG: usize = 0b10;
+    const INITIAL_GAME_LIST_FLAGS: usize = GAME_LIST_DEFAULT_FLAG;
 
     static QUIT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-    static ACTIVE_GAME_LIST_MODE: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    static ACTIVE_GAME_LIST_FLAGS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    static TRAY_ICON_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+    const ICON_FILE_NAME: &str = "icon_tray.png";
+    const GDIP_OK: i32 = 0;
+    static EMBEDDED_ICON_PNG: &[u8] = include_bytes!("../icon_tray.png");
+
+    enum GpBitmap {}
+    enum GpImage {}
+
+    #[repr(C)]
+    struct GdiplusStartupInput {
+        gdiplus_version: u32,
+        debug_event_callback: *mut c_void,
+        suppress_background_thread: i32,
+        suppress_external_codecs: i32,
+    }
+
+    #[link(name = "gdiplus")]
+    extern "system" {
+        fn GdiplusStartup(
+            token: *mut usize,
+            input: *const GdiplusStartupInput,
+            output: *mut c_void,
+        ) -> i32;
+        fn GdiplusShutdown(token: usize);
+        fn GdipCreateBitmapFromFile(filename: *const u16, bitmap: *mut *mut GpBitmap) -> i32;
+        fn GdipCreateBitmapFromStream(stream: *mut IUnknown, bitmap: *mut *mut GpBitmap) -> i32;
+        fn GdipCreateHICONFromBitmap(bitmap: *mut GpBitmap, icon: *mut HICON) -> i32;
+        fn GdipDisposeImage(image: *mut GpImage) -> i32;
+    }
+
+    #[link(name = "shlwapi")]
+    extern "system" {
+        fn SHCreateMemStream(init: *const u8, init_len: UINT) -> *mut IUnknown;
+    }
 
     pub fn main() -> io::Result<()> {
+        unsafe {
+            enable_high_dpi_rendering();
+        }
+
         let _single_instance = match SingleInstance::acquire(SINGLE_INSTANCE_MUTEX)? {
             Some(instance) => instance,
             None => return Ok(()),
@@ -83,17 +131,17 @@ mod app {
         ensure_game_list_files(&game_list_paths)?;
 
         let quit = Arc::new(AtomicBool::new(false));
-        let active_game_list_mode = Arc::new(AtomicUsize::new(GameListMode::Default as usize));
+        let active_game_list_flags = Arc::new(AtomicUsize::new(INITIAL_GAME_LIST_FLAGS));
         let monitor_quit = Arc::clone(&quit);
         let monitor_game_list_paths = game_list_paths.clone();
-        let monitor_game_list_mode = Arc::clone(&active_game_list_mode);
+        let monitor_game_list_flags = Arc::clone(&active_game_list_flags);
         let _ = QUIT_FLAG.set(Arc::clone(&quit));
-        let _ = ACTIVE_GAME_LIST_MODE.set(Arc::clone(&active_game_list_mode));
+        let _ = ACTIVE_GAME_LIST_FLAGS.set(Arc::clone(&active_game_list_flags));
 
         let monitor = thread::spawn(move || {
             monitor_games(
                 monitor_game_list_paths,
-                monitor_game_list_mode,
+                monitor_game_list_flags,
                 monitor_quit,
             )
         });
@@ -103,6 +151,12 @@ mod app {
         let _ = monitor.join();
 
         tray_result
+    }
+
+    unsafe fn enable_high_dpi_rendering() {
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
+            SetProcessDPIAware();
+        }
     }
 
     struct SingleInstance {
@@ -200,24 +254,9 @@ mod app {
         Ok(())
     }
 
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    enum GameListMode {
-        Default = 0,
-        Custom = 1,
-    }
-
-    impl GameListMode {
-        fn from_usize(value: usize) -> Self {
-            match value {
-                value if value == Self::Custom as usize => Self::Custom,
-                _ => Self::Default,
-            }
-        }
-    }
-
     fn monitor_games(
         game_list_paths: GameListPaths,
-        active_game_list_mode: Arc<AtomicUsize>,
+        active_game_list_flags: Arc<AtomicUsize>,
         quit: Arc<AtomicBool>,
     ) {
         let mut was_running = false;
@@ -225,9 +264,8 @@ mod app {
         let mut hdr_enabled_by_us = false;
 
         while !quit.load(Ordering::SeqCst) {
-            let game_list_mode =
-                GameListMode::from_usize(active_game_list_mode.load(Ordering::SeqCst));
-            let games = load_game_list(&game_list_paths, game_list_mode);
+            let game_list_flags = active_game_list_flags.load(Ordering::SeqCst);
+            let games = load_game_list(&game_list_paths, game_list_flags);
             let is_running = match matching_game_processes(&games) {
                 Ok(matches) => !matches.is_empty(),
                 Err(_) => {
@@ -262,19 +300,25 @@ mod app {
         }
     }
 
-    fn load_game_list(paths: &GameListPaths, mode: GameListMode) -> Vec<String> {
+    fn load_game_list(paths: &GameListPaths, flags: usize) -> Vec<String> {
         let mut games = Vec::new();
-        let path = match mode {
-            GameListMode::Default => &paths.default,
-            GameListMode::Custom => &paths.custom,
-        };
-        append_game_list(&mut games, path);
+        let mut seen = HashSet::new();
+        if flags & GAME_LIST_DEFAULT_FLAG != 0 {
+            append_game_list(&mut games, &mut seen, &paths.default);
+        }
+        if flags & GAME_LIST_CUSTOM_FLAG != 0 {
+            append_game_list(&mut games, &mut seen, &paths.custom);
+        }
         games
     }
 
-    fn append_game_list(games: &mut Vec<String>, path: &Path) {
+    fn append_game_list(games: &mut Vec<String>, seen: &mut HashSet<String>, path: &Path) {
         if let Ok(contents) = fs::read_to_string(path) {
-            games.extend(contents.lines().filter_map(normalize_game_name));
+            for game in contents.lines().filter_map(normalize_game_name) {
+                if seen.insert(game.clone()) {
+                    games.push(game);
+                }
+            }
         }
     }
 
@@ -479,10 +523,10 @@ mod app {
                         let _ = send_win_alt_b();
                     }
                     MENU_USE_DEFAULT_LIST => {
-                        set_game_list_mode(GameListMode::Default);
+                        toggle_game_list_flag(GAME_LIST_DEFAULT_FLAG);
                     }
                     MENU_USE_CUSTOM_LIST => {
-                        set_game_list_mode(GameListMode::Custom);
+                        toggle_game_list_flag(GAME_LIST_CUSTOM_FLAG);
                     }
                     MENU_RUN_AT_STARTUP => {
                         let _ = set_startup_enabled(!startup_enabled());
@@ -524,19 +568,19 @@ mod app {
         let custom_list = to_wide_null("Use custom game list");
         let startup = to_wide_null("Run at Windows startup");
         let quit = to_wide_null("Quit");
-        let current_game_list_mode = game_list_mode();
+        let current_game_list_flags = game_list_flags();
         let run_at_startup = startup_enabled();
         AppendMenuW(menu, MF_STRING, MENU_TOGGLE_HDR, toggle.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(
             menu,
-            MF_STRING | checked_if(current_game_list_mode == GameListMode::Default),
+            MF_STRING | checked_if(current_game_list_flags & GAME_LIST_DEFAULT_FLAG != 0),
             MENU_USE_DEFAULT_LIST,
             default_list.as_ptr(),
         );
         AppendMenuW(
             menu,
-            MF_STRING | checked_if(current_game_list_mode == GameListMode::Custom),
+            MF_STRING | checked_if(current_game_list_flags & GAME_LIST_CUSTOM_FLAG != 0),
             MENU_USE_CUSTOM_LIST,
             custom_list.as_ptr(),
         );
@@ -568,16 +612,16 @@ mod app {
         DestroyMenu(menu);
     }
 
-    fn game_list_mode() -> GameListMode {
-        ACTIVE_GAME_LIST_MODE
+    fn game_list_flags() -> usize {
+        ACTIVE_GAME_LIST_FLAGS
             .get()
-            .map(|mode| GameListMode::from_usize(mode.load(Ordering::SeqCst)))
-            .unwrap_or(GameListMode::Default)
+            .map(|flags| flags.load(Ordering::SeqCst))
+            .unwrap_or(INITIAL_GAME_LIST_FLAGS)
     }
 
-    fn set_game_list_mode(mode: GameListMode) {
-        if let Some(active_mode) = ACTIVE_GAME_LIST_MODE.get() {
-            active_mode.store(mode as usize, Ordering::SeqCst);
+    fn toggle_game_list_flag(flag: usize) {
+        if let Some(active_flags) = ACTIVE_GAME_LIST_FLAGS.get() {
+            active_flags.fetch_xor(flag, Ordering::SeqCst);
         }
     }
 
@@ -797,14 +841,21 @@ mod app {
 
     unsafe fn add_tray_icon(hwnd: HWND) -> io::Result<()> {
         let mut data = tray_icon_data(hwnd);
+        let tray_icon = load_tray_icon();
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.uCallbackMessage = WM_TRAY_ICON;
-        data.hIcon = LoadIconW(ptr::null_mut(), IDI_APPLICATION);
+        data.hIcon = tray_icon.icon;
         copy_to_fixed_wide(&mut data.szTip, APP_NAME);
 
         if Shell_NotifyIconW(NIM_ADD, &mut data) == 0 {
+            if tray_icon.owned {
+                DestroyIcon(tray_icon.icon);
+            }
             Err(io::Error::last_os_error())
         } else {
+            if tray_icon.owned {
+                TRAY_ICON_HANDLE.store(tray_icon.icon as usize, Ordering::SeqCst);
+            }
             Ok(())
         }
     }
@@ -812,6 +863,168 @@ mod app {
     unsafe fn remove_tray_icon(hwnd: HWND) {
         let mut data = tray_icon_data(hwnd);
         Shell_NotifyIconW(NIM_DELETE, &mut data);
+        let icon = TRAY_ICON_HANDLE.swap(0, Ordering::SeqCst);
+        if icon != 0 {
+            DestroyIcon(icon as HICON);
+        }
+    }
+
+    struct TrayIcon {
+        icon: HICON,
+        owned: bool,
+    }
+
+    unsafe fn load_tray_icon() -> TrayIcon {
+        if let Ok(icon) = load_embedded_png_icon() {
+            return TrayIcon { icon, owned: true };
+        }
+
+        if let Some(path) = icon_path() {
+            if let Ok(icon) = load_png_icon(&path) {
+                return TrayIcon { icon, owned: true };
+            }
+        }
+
+        TrayIcon {
+            icon: LoadIconW(ptr::null_mut(), IDI_APPLICATION),
+            owned: false,
+        }
+    }
+
+    fn icon_path() -> Option<PathBuf> {
+        let exe_dir_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join(ICON_FILE_NAME)));
+        if let Some(path) = exe_dir_path {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        let cwd_path = std::env::current_dir().ok()?.join(ICON_FILE_NAME);
+        if cwd_path.exists() {
+            Some(cwd_path)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn load_embedded_png_icon() -> io::Result<HICON> {
+        let _gdiplus = GdiplusToken::start()?;
+        let stream = SHCreateMemStream(EMBEDDED_ICON_PNG.as_ptr(), EMBEDDED_ICON_PNG.len() as UINT);
+        if stream.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "SHCreateMemStream failed",
+            ));
+        }
+
+        let _stream = ComStream(stream);
+        let mut bitmap = ptr::null_mut();
+        let status = GdipCreateBitmapFromStream(stream, &mut bitmap);
+        if status != GDIP_OK || bitmap.is_null() {
+            return Err(gdiplus_error("GdipCreateBitmapFromStream", status));
+        }
+
+        bitmap_to_icon(bitmap)
+    }
+
+    unsafe fn load_png_icon(path: &Path) -> io::Result<HICON> {
+        let _gdiplus = GdiplusToken::start()?;
+        let path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut bitmap = ptr::null_mut();
+        let status = GdipCreateBitmapFromFile(path.as_ptr(), &mut bitmap);
+        if status != GDIP_OK || bitmap.is_null() {
+            return Err(gdiplus_error("GdipCreateBitmapFromFile", status));
+        }
+
+        bitmap_to_icon(bitmap)
+    }
+
+    unsafe fn bitmap_to_icon(bitmap: *mut GpBitmap) -> io::Result<HICON> {
+        let _bitmap = GdiplusImage(bitmap as *mut GpImage);
+        let mut icon = ptr::null_mut();
+        let status = GdipCreateHICONFromBitmap(bitmap, &mut icon);
+        if status != GDIP_OK || icon.is_null() {
+            return Err(gdiplus_error("GdipCreateHICONFromBitmap", status));
+        }
+
+        Ok(scale_icon_for_tray(icon))
+    }
+
+    unsafe fn scale_icon_for_tray(icon: HICON) -> HICON {
+        let width = GetSystemMetrics(SM_CXSMICON);
+        let height = GetSystemMetrics(SM_CYSMICON);
+        if width <= 0 || height <= 0 {
+            return icon;
+        }
+
+        let scaled = CopyImage(icon as HANDLE, IMAGE_ICON, width, height, 0) as HICON;
+        if scaled.is_null() {
+            icon
+        } else {
+            DestroyIcon(icon);
+            scaled
+        }
+    }
+
+    struct ComStream(*mut IUnknown);
+
+    impl Drop for ComStream {
+        fn drop(&mut self) {
+            unsafe {
+                (*self.0).Release();
+            }
+        }
+    }
+
+    struct GdiplusToken(usize);
+
+    impl GdiplusToken {
+        unsafe fn start() -> io::Result<Self> {
+            let input = GdiplusStartupInput {
+                gdiplus_version: 1,
+                debug_event_callback: ptr::null_mut(),
+                suppress_background_thread: 0,
+                suppress_external_codecs: 0,
+            };
+            let mut token = 0;
+            let status = GdiplusStartup(&mut token, &input, ptr::null_mut());
+            if status == GDIP_OK {
+                Ok(Self(token))
+            } else {
+                Err(gdiplus_error("GdiplusStartup", status))
+            }
+        }
+    }
+
+    impl Drop for GdiplusToken {
+        fn drop(&mut self) {
+            unsafe {
+                GdiplusShutdown(self.0);
+            }
+        }
+    }
+
+    struct GdiplusImage(*mut GpImage);
+
+    impl Drop for GdiplusImage {
+        fn drop(&mut self) {
+            unsafe {
+                GdipDisposeImage(self.0);
+            }
+        }
+    }
+
+    fn gdiplus_error(operation: &str, status: i32) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("{operation} failed with GDI+ status {status}"),
+        )
     }
 
     fn tray_icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -863,6 +1076,65 @@ mod app {
         let copy_len = wide.len().min(target.len());
         target[..copy_len].copy_from_slice(&wide[..copy_len]);
         target[target.len() - 1] = 0;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn load_game_list_deduplicates_across_enabled_lists() -> io::Result<()> {
+            let dir = unique_temp_dir("dedupe");
+            fs::create_dir_all(&dir)?;
+            let paths = GameListPaths {
+                default: dir.join("games_default.txt"),
+                custom: dir.join("games_custom.txt"),
+            };
+
+            fs::write(&paths.default, "Game.exe\n\"Other Game.exe\"\n")?;
+            fs::write(&paths.custom, "game\nthird.exe\nother game.exe\n")?;
+
+            let games = load_game_list(&paths, GAME_LIST_DEFAULT_FLAG | GAME_LIST_CUSTOM_FLAG);
+
+            fs::remove_dir_all(&dir)?;
+            assert_eq!(
+                games,
+                vec![
+                    "game".to_string(),
+                    "other game".to_string(),
+                    "third".to_string()
+                ]
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn load_game_list_returns_empty_when_no_lists_enabled() -> io::Result<()> {
+            let dir = unique_temp_dir("empty");
+            fs::create_dir_all(&dir)?;
+            let paths = GameListPaths {
+                default: dir.join("games_default.txt"),
+                custom: dir.join("games_custom.txt"),
+            };
+
+            fs::write(&paths.default, "game.exe\n")?;
+            fs::write(&paths.custom, "other.exe\n")?;
+
+            let games = load_game_list(&paths, 0);
+
+            fs::remove_dir_all(&dir)?;
+            assert!(games.is_empty());
+            Ok(())
+        }
+
+        fn unique_temp_dir(name: &str) -> PathBuf {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after UNIX_EPOCH")
+                .as_nanos();
+            std::env::temp_dir().join(format!("hdr-auto-{name}-{nanos}"))
+        }
     }
 }
 

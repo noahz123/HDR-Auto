@@ -11,6 +11,7 @@ winapi = { version = "0.3", features = [
     "shellapi",
     "synchapi",
     "tlhelp32",
+    "unknwnbase",
     "winerror",
     "winnt",
     "winreg",
