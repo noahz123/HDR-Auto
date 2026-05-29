@@ -1,0 +1,18 @@
+[package]
+name = "hdr-auto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winapi = { version = "0.3", features = [
+    "errhandlingapi",
+    "handleapi",
+    "libloaderapi",
+    "shellapi",
+    "synchapi",
+    "tlhelp32",
+    "winerror",
+    "winnt",
+    "winreg",
+    "winuser",
+] }
