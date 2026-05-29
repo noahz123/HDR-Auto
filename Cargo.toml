@@ -17,3 +17,6 @@ winapi = { version = "0.3", features = [
     "winreg",
     "winuser",
 ] }
+
+[build-dependencies]
+winres = "0.1"
