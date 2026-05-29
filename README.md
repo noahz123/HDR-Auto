@@ -1,5 +1,5 @@
 # HDR-Auto
-A system tray application that automatically toggles HDR on in the Windows settings when a game that supports HDR is run. It will toggle HDR off when the game exits. This is useful because leaving HDR on results in washed out colors in Windows (setting SDR content brightness in Windows settings does not fully fix this issue).
+A system tray application that automatically toggles HDR on in the Windows settings when a game that supports HDR is run. It will toggle HDR off when the game exits. This is useful because leaving HDR on results in washed out colors in Windows (setting SDR content brightness in Windows settings does not fully fix this issue and TVs like LG OLEDs have a separate mode for HDR that adjusts the TV settings for HDR which causes further issues).
 
 1. Download the HDR-Auto.exe from the releases page.
 2. Run the program and look for the system tray icon to ensure it is running.
