@@ -28,7 +28,10 @@ mod app {
             windef::{
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, HBRUSH, HCURSOR, HICON, HWND, POINT,
             },
-            winerror::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
+            winerror::{
+                ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+                ERROR_SUCCESS,
+            },
         },
         um::{
             errhandlingapi::{GetLastError, SetLastError},
@@ -44,6 +47,14 @@ mod app {
                 TH32CS_SNAPPROCESS,
             },
             unknwnbase::IUnknown,
+            wingdi::{
+                DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+                DISPLAYCONFIG_DEVICE_INFO_HEADER,
+                DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
+                DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
+                DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
+                DISPLAYCONFIG_TOPOLOGY_ID, QDC_ONLY_ACTIVE_PATHS,
+            },
             winnt::{KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ},
             winreg::{
                 RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
@@ -53,11 +64,10 @@ mod app {
                 AppendMenuW, CopyImage, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
                 DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
                 GetMessageW, GetSystemMetrics, LoadIconW, PostMessageW, PostQuitMessage,
-                RegisterClassW, SendInput, SetForegroundWindow, SetProcessDPIAware,
+                RegisterClassW, SetForegroundWindow, SetProcessDPIAware,
                 SetProcessDpiAwarenessContext, TrackPopupMenu, TranslateMessage, CS_HREDRAW,
-                CS_VREDRAW, IDI_APPLICATION, IMAGE_ICON, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
-                KEYEVENTF_KEYUP, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
-                SM_CXSMICON, SM_CYSMICON, TPM_RIGHTBUTTON, VK_LWIN, VK_MENU, WM_APP, WM_CLOSE,
+                CS_VREDRAW, IDI_APPLICATION, IMAGE_ICON, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+                MF_UNCHECKED, MSG, SM_CXSMICON, SM_CYSMICON, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE,
                 WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
             },
         },
@@ -173,6 +183,27 @@ mod app {
             buffer_len: *mut DWORD,
             index: *mut DWORD,
         ) -> i32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetDisplayConfigBufferSizes(
+            flags: UINT,
+            num_path_array_elements: *mut UINT,
+            num_mode_info_array_elements: *mut UINT,
+        ) -> i32;
+        fn QueryDisplayConfig(
+            flags: UINT,
+            num_path_array_elements: *mut UINT,
+            path_array: *mut DISPLAYCONFIG_PATH_INFO,
+            num_mode_info_array_elements: *mut UINT,
+            mode_info_array: *mut DISPLAYCONFIG_MODE_INFO,
+            current_topology_id: *mut DISPLAYCONFIG_TOPOLOGY_ID,
+        ) -> i32;
+        fn DisplayConfigGetDeviceInfo(request_packet: *mut DISPLAYCONFIG_DEVICE_INFO_HEADER)
+            -> i32;
+        fn DisplayConfigSetDeviceInfo(request_packet: *mut DISPLAYCONFIG_DEVICE_INFO_HEADER)
+            -> i32;
     }
 
     pub fn main() -> io::Result<()> {
@@ -480,7 +511,7 @@ mod app {
     ) {
         let mut was_running = false;
         let mut initialized = false;
-        let mut hdr_enabled_by_us = false;
+        let mut hdr_snapshot = None;
 
         while !quit.load(Ordering::SeqCst) {
             let game_list_flags = active_game_list_flags.load(Ordering::SeqCst);
@@ -496,12 +527,10 @@ mod app {
             if !initialized {
                 initialized = true;
             } else if is_running && !was_running {
-                if send_win_alt_b().is_ok() {
-                    hdr_enabled_by_us = true;
-                }
+                hdr_snapshot = enable_hdr_for_game().ok().flatten();
             } else if !is_running && was_running {
-                if hdr_enabled_by_us && send_win_alt_b().is_ok() {
-                    hdr_enabled_by_us = false;
+                if let Some(snapshot) = hdr_snapshot.take() {
+                    let _ = restore_hdr_targets(&snapshot);
                 }
             }
 
@@ -631,46 +660,6 @@ mod app {
         value
     }
 
-    fn send_win_alt_b() -> io::Result<()> {
-        let mut inputs = [
-            keyboard_input(VK_LWIN as u16, false),
-            keyboard_input(VK_MENU as u16, false),
-            keyboard_input(b'B' as u16, false),
-            keyboard_input(b'B' as u16, true),
-            keyboard_input(VK_MENU as u16, true),
-            keyboard_input(VK_LWIN as u16, true),
-        ];
-
-        let sent = unsafe {
-            SendInput(
-                inputs.len() as UINT,
-                inputs.as_mut_ptr(),
-                mem::size_of::<INPUT>() as i32,
-            )
-        };
-
-        if sent == inputs.len() as UINT {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    fn keyboard_input(vk: u16, key_up: bool) -> INPUT {
-        let mut input = unsafe { mem::zeroed::<INPUT>() };
-        input.type_ = INPUT_KEYBOARD;
-        unsafe {
-            *input.u.ki_mut() = KEYBDINPUT {
-                wVk: vk,
-                wScan: 0,
-                dwFlags: if key_up { KEYEVENTF_KEYUP } else { 0 },
-                time: 0,
-                dwExtraInfo: 0,
-            };
-        }
-        input
-    }
-
     unsafe fn run_tray_app() -> io::Result<()> {
         let class_name = to_wide_null(CLASS_NAME);
         let window_name = to_wide_null(APP_NAME);
@@ -730,7 +719,7 @@ mod app {
                 match lparam as UINT {
                     WM_RBUTTONUP => show_context_menu(hwnd),
                     WM_LBUTTONDBLCLK => {
-                        let _ = send_win_alt_b();
+                        let _ = toggle_windows_hdr();
                     }
                     _ => {}
                 }
@@ -739,7 +728,7 @@ mod app {
             WM_COMMAND => {
                 match loword(wparam as usize) as usize {
                     MENU_TOGGLE_HDR => {
-                        let _ = send_win_alt_b();
+                        let _ = toggle_windows_hdr();
                     }
                     MENU_USE_DEFAULT_LIST => {
                         toggle_game_list_flag(GAME_LIST_DEFAULT_FLAG);
@@ -785,7 +774,7 @@ mod app {
             return;
         }
 
-        let toggle = to_wide_null("Toggle HDR now");
+        let toggle = to_wide_null(toggle_hdr_menu_text());
         let default_list = to_wide_null("Use default game list");
         let custom_list = to_wide_null("Use custom game list");
         let edit_custom_list = to_wide_null("Edit custom game list");
@@ -839,6 +828,216 @@ mod app {
         }
 
         DestroyMenu(menu);
+    }
+
+    fn toggle_hdr_menu_text() -> &'static str {
+        match windows_hdr_enabled() {
+            Ok(true) => "Toggle HDR Off",
+            Ok(false) => "Toggle HDR On",
+            Err(_) => "Toggle HDR On",
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct DisplayTarget {
+        adapter_id: winapi::shared::ntdef::LUID,
+        id: UINT,
+    }
+
+    #[derive(Clone)]
+    struct HdrTargetState {
+        target: DisplayTarget,
+        enabled: bool,
+    }
+
+    fn toggle_windows_hdr() -> io::Result<()> {
+        let targets = active_hdr_targets()?;
+        set_hdr_targets_enabled(&targets, !targets.iter().any(|target| target.enabled))
+    }
+
+    fn enable_hdr_for_game() -> io::Result<Option<Vec<HdrTargetState>>> {
+        let snapshot = active_hdr_targets()?;
+        let mut changed = false;
+        let mut first_error = None;
+
+        for target in &snapshot {
+            if !target.enabled {
+                match set_display_target_hdr_enabled(target.target, true) {
+                    Ok(()) => changed = true,
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+
+        if changed {
+            Ok(Some(snapshot))
+        } else if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn restore_hdr_targets(snapshot: &[HdrTargetState]) -> io::Result<()> {
+        set_hdr_target_states(snapshot)
+    }
+
+    fn windows_hdr_enabled() -> io::Result<bool> {
+        Ok(active_hdr_targets()?.iter().any(|target| target.enabled))
+    }
+
+    fn active_hdr_targets() -> io::Result<Vec<HdrTargetState>> {
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+
+        for path in active_display_paths()? {
+            let target = DisplayTarget {
+                adapter_id: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            };
+
+            if !seen.insert(display_target_key(target)) {
+                continue;
+            }
+
+            if let Some(enabled) = display_target_hdr_enabled(target)? {
+                targets.push(HdrTargetState { target, enabled });
+            }
+        }
+
+        Ok(targets)
+    }
+
+    fn active_display_paths() -> io::Result<Vec<DISPLAYCONFIG_PATH_INFO>> {
+        for _ in 0..3 {
+            let mut path_count = 0;
+            let mut mode_count = 0;
+            let status = unsafe {
+                GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+            };
+
+            if !windows_status_is(status, ERROR_SUCCESS) {
+                return Err(io::Error::from_raw_os_error(status));
+            }
+
+            let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> =
+                vec![unsafe { mem::zeroed() }; path_count as usize];
+            let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> =
+                vec![unsafe { mem::zeroed() }; mode_count as usize];
+            let status = unsafe {
+                QueryDisplayConfig(
+                    QDC_ONLY_ACTIVE_PATHS,
+                    &mut path_count,
+                    paths.as_mut_ptr(),
+                    &mut mode_count,
+                    modes.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+
+            if windows_status_is(status, ERROR_SUCCESS) {
+                paths.truncate(path_count as usize);
+                return Ok(paths);
+            }
+            if !windows_status_is(status, ERROR_INSUFFICIENT_BUFFER) {
+                return Err(io::Error::from_raw_os_error(status));
+            }
+        }
+
+        Err(io::Error::from_raw_os_error(
+            ERROR_INSUFFICIENT_BUFFER as i32,
+        ))
+    }
+
+    fn display_target_hdr_enabled(target: DisplayTarget) -> io::Result<Option<bool>> {
+        let mut info: DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO = unsafe { mem::zeroed() };
+        info.header._type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        info.header.size = mem::size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as UINT;
+        info.header.adapterId = target.adapter_id;
+        info.header.id = target.id;
+
+        let status = unsafe { DisplayConfigGetDeviceInfo(&mut info.header) };
+        if windows_status_is(status, ERROR_SUCCESS) {
+            if info.advancedColorSupported() != 0 {
+                Ok(Some(info.advancedColorEnabled() != 0))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Err(io::Error::from_raw_os_error(status))
+        }
+    }
+
+    fn set_hdr_targets_enabled(targets: &[HdrTargetState], enabled: bool) -> io::Result<()> {
+        let mut first_error = None;
+
+        for target in targets {
+            if target.enabled != enabled {
+                match set_display_target_hdr_enabled(target.target, enabled) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_hdr_target_states(targets: &[HdrTargetState]) -> io::Result<()> {
+        let mut first_error = None;
+
+        for target in targets {
+            match set_display_target_hdr_enabled(target.target, target.enabled) {
+                Ok(()) => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_display_target_hdr_enabled(target: DisplayTarget, enabled: bool) -> io::Result<()> {
+        let mut state: DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE = unsafe { mem::zeroed() };
+        state.header._type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+        state.header.size = mem::size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>() as UINT;
+        state.header.adapterId = target.adapter_id;
+        state.header.id = target.id;
+        state.set_enableAdvancedColor(if enabled { 1 } else { 0 });
+
+        let status = unsafe { DisplayConfigSetDeviceInfo(&mut state.header) };
+        if windows_status_is(status, ERROR_SUCCESS) {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status))
+        }
+    }
+
+    fn display_target_key(target: DisplayTarget) -> (u32, i32, u32) {
+        (
+            target.adapter_id.LowPart,
+            target.adapter_id.HighPart,
+            target.id,
+        )
     }
 
     fn game_list_flags() -> usize {
@@ -1164,6 +1363,10 @@ mod app {
     }
 
     fn registry_status_is(status: i32, code: DWORD) -> bool {
+        status == code as i32
+    }
+
+    fn windows_status_is(status: i32, code: DWORD) -> bool {
         status == code as i32
     }
 
