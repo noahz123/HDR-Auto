@@ -30,7 +30,7 @@ mod app {
             },
             winerror::{
                 ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
-                ERROR_SUCCESS,
+                ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_SUCCESS,
             },
         },
         um::{
@@ -107,6 +107,11 @@ mod app {
     const HTTP_QUERY_FLAG_NUMBER: DWORD = 0x2000_0000;
     const DOWNLOAD_BUFFER_SIZE: usize = 8 * 1024;
     const MIN_DOWNLOADED_GAME_LIST_ENTRIES: usize = 25;
+    const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: u32 = 15;
+    const DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE: u32 = 16;
+    const ADVANCED_COLOR_INFO_2_HDR_SUPPORTED: u32 = 1 << 4;
+    const ADVANCED_COLOR_INFO_2_HDR_USER_ENABLED: u32 = 1 << 5;
+    const SET_HDR_STATE_ENABLE_HDR: u32 = 1;
 
     static QUIT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     static ACTIVE_GAME_LIST_FLAGS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
@@ -850,6 +855,31 @@ mod app {
         enabled: bool,
     }
 
+    #[repr(C)]
+    struct DisplayConfigGetAdvancedColorInfo2 {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+        value: u32,
+        _color_encoding: u32,
+        _bits_per_color_channel: u32,
+        _active_color_mode: u32,
+    }
+
+    impl DisplayConfigGetAdvancedColorInfo2 {
+        fn high_dynamic_range_supported(&self) -> bool {
+            self.value & ADVANCED_COLOR_INFO_2_HDR_SUPPORTED != 0
+        }
+
+        fn high_dynamic_range_user_enabled(&self) -> bool {
+            self.value & ADVANCED_COLOR_INFO_2_HDR_USER_ENABLED != 0
+        }
+    }
+
+    #[repr(C)]
+    struct DisplayConfigSetHdrState {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+        value: u32,
+    }
+
     fn toggle_windows_hdr() -> io::Result<()> {
         let targets = active_hdr_targets()?;
         set_hdr_targets_enabled(&targets, !targets.iter().any(|target| target.enabled))
@@ -954,6 +984,36 @@ mod app {
     }
 
     fn display_target_hdr_enabled(target: DisplayTarget) -> io::Result<Option<bool>> {
+        // Newer Windows builds split HDR from broader Advanced Color states like WCG.
+        match display_target_hdr_enabled_v2(target) {
+            Ok(enabled) => return Ok(enabled),
+            Err(error) if hdr_specific_display_config_unavailable(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        display_target_hdr_enabled_legacy(target)
+    }
+
+    fn display_target_hdr_enabled_v2(target: DisplayTarget) -> io::Result<Option<bool>> {
+        let mut info: DisplayConfigGetAdvancedColorInfo2 = unsafe { mem::zeroed() };
+        info.header._type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;
+        info.header.size = mem::size_of::<DisplayConfigGetAdvancedColorInfo2>() as UINT;
+        info.header.adapterId = target.adapter_id;
+        info.header.id = target.id;
+
+        let status = unsafe { DisplayConfigGetDeviceInfo(&mut info.header) };
+        if !windows_status_is(status, ERROR_SUCCESS) {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+
+        if info.high_dynamic_range_supported() {
+            Ok(Some(info.high_dynamic_range_user_enabled()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn display_target_hdr_enabled_legacy(target: DisplayTarget) -> io::Result<Option<bool>> {
         let mut info: DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO = unsafe { mem::zeroed() };
         info.header._type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
         info.header.size = mem::size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as UINT;
@@ -1017,6 +1077,35 @@ mod app {
     }
 
     fn set_display_target_hdr_enabled(target: DisplayTarget, enabled: bool) -> io::Result<()> {
+        match set_display_target_hdr_enabled_v2(target, enabled) {
+            Ok(()) => return Ok(()),
+            Err(error) if hdr_specific_display_config_unavailable(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        set_display_target_hdr_enabled_legacy(target, enabled)
+    }
+
+    fn set_display_target_hdr_enabled_v2(target: DisplayTarget, enabled: bool) -> io::Result<()> {
+        let mut state: DisplayConfigSetHdrState = unsafe { mem::zeroed() };
+        state.header._type = DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE;
+        state.header.size = mem::size_of::<DisplayConfigSetHdrState>() as UINT;
+        state.header.adapterId = target.adapter_id;
+        state.header.id = target.id;
+        state.value = if enabled { SET_HDR_STATE_ENABLE_HDR } else { 0 };
+
+        let status = unsafe { DisplayConfigSetDeviceInfo(&mut state.header) };
+        if windows_status_is(status, ERROR_SUCCESS) {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status))
+        }
+    }
+
+    fn set_display_target_hdr_enabled_legacy(
+        target: DisplayTarget,
+        enabled: bool,
+    ) -> io::Result<()> {
         let mut state: DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE = unsafe { mem::zeroed() };
         state.header._type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
         state.header.size = mem::size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>() as UINT;
@@ -1030,6 +1119,14 @@ mod app {
         } else {
             Err(io::Error::from_raw_os_error(status))
         }
+    }
+
+    fn hdr_specific_display_config_unavailable(error: &io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_INVALID_PARAMETER as i32 || code == ERROR_NOT_SUPPORTED as i32
+        )
     }
 
     fn display_target_key(target: DisplayTarget) -> (u32, i32, u32) {
